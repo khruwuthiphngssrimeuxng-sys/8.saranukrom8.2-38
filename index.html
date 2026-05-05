@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>E-Book Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --toolbar-h: 60px;
+  --bg: #1a1a1a;
+  --toolbar-bg: #111;
+  --btn-bg: #2a2a2a;
+  --btn-hover: #3c3c3c;
+  --accent: #e8c97a;
+  --text: #eee;
+  --shadow: rgba(0,0,0,0.6);
+}
+
+body {
+  background: var(--bg);
+  overflow: hidden;
+  font-family: 'Segoe UI', sans-serif;
+  color: var(--text);
+  touch-action: none;
+  user-select: none;
+}
+
+#viewer {
+  width: 100vw;
+  height: calc(100vh - var(--toolbar-h));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+#stage {
+  transform-origin: center center;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+}
+#stage.dragging { cursor: grabbing; }
+
+#spread {
+  display: flex;
+  position: relative;
+  box-shadow: 0 20px 60px var(--shadow);
+}
+
+.slot {
+  position: relative;
+  overflow: hidden;
+  background: #e8e8e8;
+  flex-shrink: 0;
+}
+
+/* 🔑 คมชัด: canvas ต้องไม่ถูก browser scale มัว */
+.slot canvas {
+  display: block;
+  position: absolute;
+  top: 0; left: 0;
+  /* ขนาดแสดงผล (CSS px) กำหนดด้วย JS */
+  image-rendering: -webkit-optimize-contrast; /* Safari */
+  image-rendering: crisp-edges;               /* Firefox */
+  image-rendering: pixelated;                 /* Chrome fallback สำหรับ bitmap */
+}
+
+/* สำหรับหน้าที่มีข้อความ ต้องใช้ smooth แทน pixelated */
+.slot canvas.text-mode {
+  image-rendering: auto;
+  image-rendering: -webkit-optimize-contrast;
+}
+
+#spine {
+  width: 4px;
+  background: linear-gradient(to right, #999, #ccc, #999);
+  flex-shrink: 0;
+}
+
+/* Flip layer */
+#flipLayer {
+  position: absolute;
+  top: 0;
+  pointer-events: none;
+  transform-origin: left center;
+  z-index: 10;
+  opacity: 0;
+}
+#flipLayer.flipping-next {
+  animation: flipNext 0.4s ease-in-out forwards;
+}
+#flipLayer.flipping-prev {
+  animation: flipPrev 0.4s ease-in-out forwards;
+}
+@keyframes flipNext {
+  0%   { transform: perspective(1200px) rotateY(0deg);    opacity: 1; }
+  50%  { transform: perspective(1200px) rotateY(-90deg);  opacity: 0.6; }
+  100% { transform: perspective(1200px) rotateY(-180deg); opacity: 0; }
+}
+@keyframes flipPrev {
+  0%   { transform: perspective(1200px) rotateY(-180deg); opacity: 0; }
+  50%  { transform: perspective(1200px) rotateY(-90deg);  opacity: 0.6; }
+  100% { transform: perspective(1200px) rotateY(0deg);    opacity: 1; }
+}
+
+/* Click zones */
+.click-zone {
+  position: absolute; top: 0; bottom: 0; width: 14%;
+  z-index: 5; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  opacity: 0; transition: opacity 0.2s;
+}
+.click-zone:hover { opacity: 1; }
+#zoneLeft  { left: 0;  background: linear-gradient(to right, rgba(0,0,0,0.18), transparent); }
+#zoneRight { right: 0; background: linear-gradient(to left,  rgba(0,0,0,0.18), transparent); }
+.arrow { font-size: 30px; color: #fff; text-shadow: 0 2px 10px #000; }
+
+/* Loading */
+#loadingOverlay {
+  position: fixed; inset: 0;
+  background: var(--bg);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 14px; z-index: 9999;
+  transition: opacity 0.4s;
+}
+#loadingOverlay.hidden { opacity: 0; pointer-events: none; }
+.spinner {
+  width: 44px; height: 44px;
+  border: 3px solid #333; border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#loadingText { color: var(--accent); font-size: 14px; }
+#progressBar { width: 200px; height: 4px; background: #333; border-radius: 2px; overflow: hidden; }
+#progressFill { height: 100%; width: 0%; background: var(--accent); transition: width 0.3s; }
+#loadingPct { color: #888; font-size: 12px; }
+
+/* Toolbar */
+.toolbar {
+  position: fixed; bottom: 0; width: 100%;
+  height: var(--toolbar-h);
+  background: var(--toolbar-bg);
+  border-top: 1px solid #2a2a2a;
+  display: flex; align-items: center;
+  justify-content: center; gap: 6px;
+  z-index: 999; padding: 0 8px;
+}
+.toolbar button {
+  background: var(--btn-bg); color: var(--text);
+  border: 1px solid #333; border-radius: 8px;
+  padding: 7px 13px; font-size: 15px; cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+.toolbar button:hover  { background: var(--btn-hover); transform: scale(1.05); }
+.toolbar button:active { transform: scale(0.95); }
+.toolbar button:disabled { opacity: 0.35; cursor: default; transform: none; }
+#pageInfo { color: var(--accent); font-size: 13px; min-width: 90px; text-align: center; }
+.sep { width: 1px; height: 26px; background: #333; margin: 0 2px; }
+#pageInput {
+  width: 48px; background: #222; color: var(--accent);
+  border: 1px solid #444; border-radius: 6px;
+  text-align: center; font-size: 13px; padding: 4px; outline: none;
+}
+
+/* Quality badge */
+#qualityBadge {
+  position: fixed; top: 10px; right: 12px;
+  background: rgba(0,0,0,0.55); color: var(--accent);
+  font-size: 11px; padding: 3px 8px; border-radius: 10px;
+  z-index: 100; opacity: 0; transition: opacity 0.4s;
+  pointer-events: none;
+}
+#qualityBadge.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<div id="loadingOverlay">
+  <div class="spinner"></div>
+  <div id="loadingText">กำลังเปิดหนังสือ...</div>
+  <div id="progressBar"><div id="progressFill"></div></div>
+  <div id="loadingPct">0%</div>
+</div>
+
+<div id="qualityBadge"></div>
+
+<div id="viewer">
+  <div id="stage">
+    <div id="spread">
+      <div class="slot" id="slotLeft"></div>
+      <div id="spine"></div>
+      <div class="slot" id="slotRight"></div>
+    </div>
+    <canvas id="flipLayer"></canvas>
+    <div class="click-zone" id="zoneLeft"  onclick="goPage(currentPage - spread)"><div class="arrow">‹</div></div>
+    <div class="click-zone" id="zoneRight" onclick="goPage(currentPage + spread)"><div class="arrow">›</div></div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <button id="btnPrev" onclick="goPage(currentPage - spread)">◀</button>
+  <button id="btnNext" onclick="goPage(currentPage + spread)">▶</button>
+  <div class="sep"></div>
+  <button onclick="zoomOut()">➖</button>
+  <input id="pageInput" type="number" min="1" onchange="jumpToPage(this.value)" />
+  <span id="pageInfo">/ —</span>
+  <button onclick="zoomIn()">➕</button>
+  <div class="sep"></div>
+  <button onclick="resetView()">⊙</button>
+</div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+
+// ═══════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════
+const PDF_URL      = "book.pdf";
+const RENDER_RANGE = 3;
+const DESTROY_RANGE = 8;
+
+// 🔑 SHARPNESS CONFIG
+// DPR สูง = คมชัด แต่ใช้ RAM มากขึ้น
+// desktop: 2-3, mobile: 2 (เกิน 3 ไม่ต่างกันแล้ว แต่หนักมาก)
+const DPR_DESKTOP = Math.min(window.devicePixelRatio || 1, 3);
+const DPR_MOBILE  = Math.min(window.devicePixelRatio || 1, 2);
+
+// ═══════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════
+let pdfDoc      = null;
+let totalPages  = 0;
+let currentPage = 1;
+let spread      = 1;
+let pageW       = 0;   // CSS px (display size)
+let pageH       = 0;
+let scale       = 1;
+let panX        = 0;
+let panY        = 0;
+let canvasCache = {};
+let renderQueue = [];
+let isRendering = false;
+let isFlipping  = false;
+let initDone    = false;
+
+const dpr = isMobile() ? DPR_MOBILE : DPR_DESKTOP;
+
+// ═══════════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════════
+pdfjsLib.getDocument(PDF_URL).promise.then(pdf => {
+  pdfDoc     = pdf;
+  totalPages = pdf.numPages;
+
+  renderPageToCache(1).then(() => {
+    setupLayout();
+    initDone = true;
+    showSpread(1);
+    hideLoading();
+    schedulePreload(1);
+  });
+
+}).catch(err => {
+  document.getElementById("loadingText").textContent = "โหลดไม่สำเร็จ: " + err.message;
+  document.getElementById("loadingText").style.color = "#e87a7a";
+});
+
+// ═══════════════════════════════════════════
+//  LAYOUT
+// ═══════════════════════════════════════════
+function setupLayout() {
+  const mobile = isMobile();
+  spread = mobile ? 1 : 2;
+
+  document.getElementById("spine").style.display = mobile ? "none" : "block";
+
+  const avW = window.innerWidth  * (mobile ? 0.94 : 0.47);
+  const avH = (window.innerHeight - 60) * 0.94;
+
+  const c1  = canvasCache[1];
+  // c1 ถูก render ที่ DPR สูง ต้องหาร DPR กลับเพื่อได้ขนาด CSS px
+  const srcW = c1.width  / dpr;
+  const srcH = c1.height / dpr;
+  const fit  = Math.min(avW / srcW, avH / srcH);
+  pageW = Math.round(srcW * fit);
+  pageH = Math.round(srcH * fit);
+
+  const sl = document.getElementById("slotLeft");
+  const sr = document.getElementById("slotRight");
+  sl.style.cssText = `width:${pageW}px;height:${pageH}px`;
+  sr.style.cssText = `width:${pageW}px;height:${pageH}px;display:${mobile?"none":"block"}`;
+
+  const fl = document.getElementById("flipLayer");
+  fl.width  = pageW * dpr;
+  fl.height = pageH * dpr;
+  fl.style.cssText =
+    `width:${pageW}px;height:${pageH}px;position:absolute;top:0;` +
+    (mobile ? "left:0;" : `left:${pageW + 4}px;`) +
+    "opacity:0;pointer-events:none;";
+}
+
+// ═══════════════════════════════════════════
+//  SHOW SPREAD
+// ═══════════════════════════════════════════
+function showSpread(page) {
+  currentPage = clampPage(page);
+  drawSlot("slotLeft",  currentPage);
+  if (spread === 2) drawSlot("slotRight", currentPage + 1);
+  updateUI();
+  schedulePreload(currentPage);
+}
+
+function drawSlot(slotId, pageNum) {
+  const slot = document.getElementById(slotId);
+  slot.innerHTML = "";
+  if (!pageNum || pageNum > totalPages) return;
+
+  if (canvasCache[pageNum]) {
+    slot.appendChild(makeDisplayCanvas(canvasCache[pageNum]));
+  } else {
+    renderPageToCache(pageNum).then(() => {
+      slot.innerHTML = "";
+      slot.appendChild(makeDisplayCanvas(canvasCache[pageNum]));
+    });
+  }
+}
+
+// 🔑 สร้าง canvas แสดงผลขนาด CSS px
+// แต่ draw จาก offscreen ที่ render ด้วย DPR สูง → คมชัด
+function makeDisplayCanvas(src) {
+  const c = document.createElement("canvas");
+
+  // canvas ขนาด CSS px × DPR = pixel จริง
+  c.width  = pageW * dpr;
+  c.height = pageH * dpr;
+
+  // แสดงผลขนาด CSS px (browser จะ scale ลง → คมเต็ม)
+  c.style.width  = pageW + "px";
+  c.style.height = pageH + "px";
+
+  // 🔑 ใช้ imageSmoothingQuality สูงสุด
+  const ctx = c.getContext("2d");
+  ctx.imageSmoothingEnabled  = true;
+  ctx.imageSmoothingQuality  = "high";
+
+  ctx.drawImage(src, 0, 0, c.width, c.height);
+
+  // ข้อความ: ใช้ auto rendering (smooth subpixel)
+  c.classList.add("text-mode");
+  return c;
+}
+
+// ═══════════════════════════════════════════
+//  GO PAGE + FLIP ANIMATION
+// ═══════════════════════════════════════════
+function goPage(page) {
+  if (isFlipping || !initDone) return;
+  const target = clampPage(page);
+  if (target === currentPage) return;
+  const dir = target > currentPage ? "next" : "prev";
+
+  ensureRendered(target).then(() => {
+    playFlip(dir, () => showSpread(target));
+  });
+}
+
+function jumpToPage(val) {
+  const p = parseInt(val);
+  if (!isNaN(p)) goPage(p);
+}
+
+function playFlip(dir, onDone) {
+  if (isFlipping) return;
+  isFlipping = true;
+
+  const fl  = document.getElementById("flipLayer");
+  const ctx = fl.getContext("2d");
+  ctx.clearRect(0, 0, fl.width, fl.height);
+
+  const pageToFlip = dir === "next"
+    ? (spread === 2 ? currentPage + 1 : currentPage)
+    : currentPage;
+
+  const src = canvasCache[pageToFlip];
+  if (src) {
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, fl.width, fl.height);
+  }
+
+  fl.className = "";
+  fl.style.opacity = "1";
+  requestAnimationFrame(() => {
+    fl.classList.add(dir === "next" ? "flipping-next" : "flipping-prev");
+    setTimeout(() => {
+      fl.className = "";
+      fl.style.opacity = "0";
+      isFlipping = false;
+      onDone();
+    }, 420);
+  });
+}
+
+// ═══════════════════════════════════════════
+//  RENDER TO CACHE  ← หัวใจของความคมชัด
+// ═══════════════════════════════════════════
+function renderPageToCache(num) {
+  if (canvasCache[num]) return Promise.resolve();
+  if (num < 1 || num > totalPages) return Promise.resolve();
+
+  return pdfDoc.getPage(num).then(page => {
+    const vp0 = page.getViewport({ scale: 1 });
+
+    // 🔑 SHARPNESS TRICK 1: render ที่ความละเอียดสูงกว่าที่แสดง
+    // ใช้ DPR × scale ที่เหมาะสมกับจอ
+    // สำหรับหน้าที่มีข้อความ: render สูงกว่า display 2-3x = ขอบตัวอักษรคม
+    const targetW = pageW > 0
+      ? pageW * dpr
+      : vp0.width * dpr;
+
+    const renderScale = targetW / vp0.width;
+    const vp = page.getViewport({ scale: renderScale });
+
+    const offscreen = document.createElement("canvas");
+    offscreen.width  = Math.round(vp.width);
+    offscreen.height = Math.round(vp.height);
+
+    const ctx = offscreen.getContext("2d", {
+      // 🔑 SHARPNESS TRICK 2: alpha: false เร็วขึ้นและคมขึ้นสำหรับหน้าสีขาว
+      alpha: false,
+      // 🔑 SHARPNESS TRICK 3: desynchronized ลด latency บางจอ
+      desynchronized: false
+    });
+
+    // 🔑 SHARPNESS TRICK 4: ปิด smoothing ตอน render เพราะ pdf.js วาด vector ตรงๆ
+    ctx.imageSmoothingEnabled = false;
+
+    return page.render({
+      canvasContext: ctx,
+      viewport: vp,
+      // 🔑 SHARPNESS TRICK 5: intent = "print" → pdf.js ใช้ anti-aliasing แบบ print
+      // คมกว่า "display" สำหรับข้อความเล็ก
+      intent: "print"
+    }).promise.then(() => {
+      canvasCache[num] = offscreen;
+
+      if (!initDone) {
+        const pct = Math.round((Object.keys(canvasCache).length / 2) * 100);
+        document.getElementById("progressFill").style.width = Math.min(pct, 95) + "%";
+        document.getElementById("loadingPct").textContent   = Math.min(pct, 95) + "%";
+      }
+    });
+  });
+}
+
+function ensureRendered(page) {
+  const jobs = [];
+  for (let i = page; i <= Math.min(page + spread - 1, totalPages); i++) {
+    if (!canvasCache[i]) jobs.push(renderPageToCache(i));
+  }
+  return Promise.all(jobs);
+}
+
+// ═══════════════════════════════════════════
+//  VIRTUAL PRELOAD / DESTROY
+// ═══════════════════════════════════════════
+function schedulePreload(center) {
+  Object.keys(canvasCache).forEach(k => {
+    if (Math.abs(k - center) > DESTROY_RANGE) delete canvasCache[k];
+  });
+
+  renderQueue = [];
+  for (let d = 1; d <= RENDER_RANGE; d++) {
+    [center + d, center - d].forEach(p => {
+      if (p >= 1 && p <= totalPages && !canvasCache[p]) renderQueue.push(p);
+    });
+  }
+  processQueue();
+}
+
+function processQueue() {
+  if (isRendering || renderQueue.length === 0) return;
+  isRendering = true;
+  renderPageToCache(renderQueue.shift()).then(() => {
+    isRendering = false;
+    processQueue();
+  });
+}
+
+// ═══════════════════════════════════════════
+//  UI
+// ═══════════════════════════════════════════
+function updateUI() {
+  document.getElementById("pageInput").value = currentPage;
+  document.getElementById("pageInput").max   = totalPages;
+  document.getElementById("pageInfo").textContent = `/ ${totalPages}`;
+  document.getElementById("btnPrev").disabled = currentPage <= 1;
+  document.getElementById("btnNext").disabled = currentPage + spread - 1 >= totalPages;
+}
+
+function hideLoading() {
+  document.getElementById("progressFill").style.width = "100%";
+  document.getElementById("loadingPct").textContent   = "พร้อมแล้ว";
+  const ov = document.getElementById("loadingOverlay");
+  ov.classList.add("hidden");
+  setTimeout(() => ov.style.display = "none", 500);
+
+  // แสดง quality badge ชั่วคราว
+  const badge = document.getElementById("qualityBadge");
+  badge.textContent = `🔍 คมชัด ${Math.round(dpr * 100)}% DPR×${dpr}`;
+  badge.classList.add("show");
+  setTimeout(() => badge.classList.remove("show"), 3000);
+}
+
+// ═══════════════════════════════════════════
+//  ZOOM & PAN
+// ═══════════════════════════════════════════
+function zoomIn()  { scale = Math.min(5, +(scale + 0.25).toFixed(2)); applyTransform(); }
+function zoomOut() { scale = Math.max(0.4, +(scale - 0.25).toFixed(2)); applyTransform(); }
+function resetView() { scale = 1; panX = 0; panY = 0; applyTransform(); }
+
+function applyTransform() {
+  document.getElementById("stage").style.transform =
+    `translate(${panX}px,${panY}px) scale(${scale})`;
+}
+
+// ── Drag ──
+const viewer = document.getElementById("viewer");
+const stage  = document.getElementById("stage");
+let isDrag = false, dsx, dsy, psx, psy;
+
+viewer.addEventListener("mousedown", e => {
+  if (e.button !== 0) return;
+  dsx = e.clientX; dsy = e.clientY; psx = panX; psy = panY; isDrag = false;
+});
+window.addEventListener("mousemove", e => {
+  if (dsx === undefined) return;
+  const dx = e.clientX - dsx, dy = e.clientY - dsy;
+  if (!isDrag && scale > 1 && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) {
+    isDrag = true; stage.classList.add("dragging");
+  }
+  if (isDrag) { panX = psx + dx; panY = psy + dy; applyTransform(); }
+});
+window.addEventListener("mouseup", () => {
+  isDrag = false; dsx = undefined; stage.classList.remove("dragging");
+});
+
+// ── Wheel zoom ──
+viewer.addEventListener("wheel", e => {
+  e.preventDefault();
+  scale = Math.max(0.4, Math.min(5, +(scale + (e.deltaY > 0 ? -0.15 : 0.15)).toFixed(2)));
+  if (scale <= 1) { panX = 0; panY = 0; }
+  applyTransform();
+}, { passive: false });
+
+// ── Touch ──
+let tx = 0, ty = 0, pinchDist = 0;
+document.addEventListener("touchstart", e => {
+  if (e.touches.length === 1) { tx = e.touches[0].clientX; ty = e.touches[0].clientY; }
+}, { passive: true });
+
+document.addEventListener("touchend", e => {
+  if (e.changedTouches.length !== 1) return;
+  const dx = e.changedTouches[0].clientX - tx;
+  if (Math.abs(e.changedTouches[0].clientY - ty) > 60) return;
+  if (dx < -50) goPage(currentPage + spread);
+  if (dx >  50) goPage(currentPage - spread);
+}, { passive: true });
+
+document.addEventListener("touchmove", e => {
+  if (e.touches.length !== 2) return;
+  e.preventDefault();
+  const d = Math.hypot(
+    e.touches[0].clientX - e.touches[1].clientX,
+    e.touches[0].clientY - e.touches[1].clientY
+  );
+  if (pinchDist > 0) {
+    scale = Math.max(0.4, Math.min(5, scale * (d / pinchDist)));
+    applyTransform();
+  }
+  pinchDist = d;
+}, { passive: false });
+document.addEventListener("touchend", () => { pinchDist = 0; });
+
+// ── Keyboard ──
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight" || e.key === "PageDown") goPage(currentPage + spread);
+  if (e.key === "ArrowLeft"  || e.key === "PageUp")   goPage(currentPage - spread);
+  if (e.key === "+" || e.key === "=") zoomIn();
+  if (e.key === "-") zoomOut();
+  if (e.key === "0") resetView();
+});
+
+// ═══════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════
+function clampPage(p) { return Math.max(1, Math.min(p, totalPages)); }
+function isMobile()   { return window.innerWidth < 768; }
+</script>
+</body>
+</html>
